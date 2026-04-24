@@ -6,10 +6,14 @@ edition = "2021"
 [dependencies]
 xreal_one_driver = { git = "https://github.com/rohitsangwan01/xreal_one_driver" }
 enigo = "0.6"
-global-hotkey = "0.7"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = ["Win32_UI_HiDpi"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 opt-level = 3
