@@ -1,20 +1,23 @@
 // armouse: head-motion mouse control for XReal One glasses on Windows.
 //
-// Milestone 5: while Right Alt is held (mouse-mode active), Left Ctrl is
-// a left-click and Left Alt is a right-click, with press/release semantics
-// so drag works. When Right Alt is NOT held, Left Ctrl / Left Alt pass
-// through to Windows unchanged.
+// Controls:
+//   - Shift+CapsLock: toggle mouse mode on/off. The Caps Lock state is NOT
+//     affected — we swallow both the Shift and Caps Lock events in this
+//     chord so Windows never sees it.
+//   - While mouse mode is active:
+//       * head motion drives the cursor
+//       * Right Alt  = left click  (press/release, so drag works)
+//       * Right Ctrl = right click (press/release)
+//     Right Ctrl and Right Alt events are consumed while active. When
+//     inactive they pass through untouched — so Left Ctrl/Alt shortcuts
+//     (Ctrl+C, Alt+Tab, etc.) are never affected, even in active mode.
 //
 // Threading model:
 //   - IMU reader thread: loops xreal.next() and pushes samples through an
-//     mpsc channel. Keeps the TCP socket drained even while we're idle.
+//     mpsc channel. Keeps the TCP socket drained even while idle.
 //   - Keyboard hook thread: installs a WH_KEYBOARD_LL hook and runs a
-//     Windows message pump. The hook callback
-//       * flips an AtomicBool for Right Alt (observed, always passes through)
-//       * for Left Ctrl / Left Alt:
-//         - if Right Alt is held: consume the event and send a ClickEvent
-//           through an mpsc channel to the main thread
-//         - if not held: let it pass through normally
+//     Windows message pump. Observes shift state and the Shift+CapsLock
+//     chord; flips MOUSE_MODE_ACTIVE; routes click events to main.
 //   - Main thread: owns Enigo. Each tick it drains both channels, integrates
 //     gyro into the current Session, nudges the cursor toward desired, and
 //     emits left/right mouse press/release events.
@@ -56,7 +59,9 @@ const MOUSE_UPDATE_INTERVAL: Duration = Duration::from_millis(8); // ~125 Hz
 const DEBUG_INTERVAL: Duration = Duration::from_millis(500);
 
 // Shared state between the keyboard hook thread and main thread.
-static RIGHT_ALT_DOWN: AtomicBool = AtomicBool::new(false);
+//   MOUSE_MODE_ACTIVE: toggled by Shift+CapsLock. When true, head motion
+//   drives the cursor and Left Ctrl / Left Alt become click chords.
+static MOUSE_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
 fn enable_per_monitor_dpi_awareness() {
@@ -70,16 +75,27 @@ fn enable_per_monitor_dpi_awareness() {
 
 #[cfg(windows)]
 mod kb_hook {
-    use super::{ClickEvent, CLICK_TX, RIGHT_ALT_DOWN};
+    use super::{ClickEvent, CLICK_TX, MOUSE_MODE_ACTIVE};
     use enigo::Direction;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_LMENU, VK_RMENU};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        VK_CAPITAL, VK_LSHIFT, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
         HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
         WM_SYSKEYUP,
     };
+
+    // Local shift tracking. The hook sees every key event so we can trust
+    // these; we don't need to query Windows.
+    static LSHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+    static RSHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+
+    fn shift_held() -> bool {
+        LSHIFT_DOWN.load(Ordering::Acquire) || RSHIFT_DOWN.load(Ordering::Acquire)
+    }
 
     unsafe extern "system" fn low_level_keyboard_proc(
         code: i32,
@@ -96,29 +112,51 @@ mod kb_hook {
         let is_up = matches!(msg, WM_KEYUP | WM_SYSKEYUP);
         let vk = kbd.vkCode;
 
-        // Right Alt: update shared state and swallow. If we let it through,
-        // Windows sees a bare Alt keystroke on release and activates the
-        // active window's menu bar (or the context menu for some apps).
-        // Trade-off: Right Alt cannot function as AltGr while armouse runs.
-        if vk == VK_RMENU.0 as u32 {
+        // Shift: track state, always pass through.
+        if vk == VK_LSHIFT.0 as u32 {
             if is_down {
-                RIGHT_ALT_DOWN.store(true, Ordering::Release);
+                LSHIFT_DOWN.store(true, Ordering::Release);
             } else if is_up {
-                RIGHT_ALT_DOWN.store(false, Ordering::Release);
+                LSHIFT_DOWN.store(false, Ordering::Release);
             }
-            return LRESULT(1);
+            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+        }
+        if vk == VK_RSHIFT.0 as u32 {
+            if is_down {
+                RSHIFT_DOWN.store(true, Ordering::Release);
+            } else if is_up {
+                RSHIFT_DOWN.store(false, Ordering::Release);
+            }
+            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
         }
 
-        // Left Ctrl / Left Alt: only intercept while mouse mode is active.
-        // Otherwise they must pass through untouched.
-        let click_key = vk == VK_LCONTROL.0 as u32 || vk == VK_LMENU.0 as u32;
-        if click_key && RIGHT_ALT_DOWN.load(Ordering::Acquire) && (is_down || is_up) {
+        // Caps Lock: if Shift is held, this is our toggle chord. Swallow
+        // every event so Windows never processes it and the caps-lock LED
+        // / state stays unchanged.
+        if vk == VK_CAPITAL.0 as u32 {
+            if shift_held() {
+                if is_down {
+                    // Toggle on the key-down edge, ignore auto-repeats by
+                    // simply flipping (a held Caps Lock won't flood because
+                    // the OS sends one WM_KEYDOWN, not a stream).
+                    let prev = MOUSE_MODE_ACTIVE.fetch_xor(true, Ordering::AcqRel);
+                    let _ = prev; // value before toggle — unused
+                }
+                return LRESULT(1);
+            }
+            // No shift held — let Caps Lock work normally.
+            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+        }
+
+        // Right Ctrl / Right Alt: intercept only while mouse mode is active.
+        let click_key = vk == VK_RCONTROL.0 as u32 || vk == VK_RMENU.0 as u32;
+        if click_key && MOUSE_MODE_ACTIVE.load(Ordering::Acquire) && (is_down || is_up) {
             let dir = if is_down {
                 Direction::Press
             } else {
                 Direction::Release
             };
-            let event = if vk == VK_LCONTROL.0 as u32 {
+            let event = if vk == VK_RMENU.0 as u32 {
                 ClickEvent::Left(dir)
             } else {
                 ClickEvent::Right(dir)
@@ -126,8 +164,8 @@ mod kb_hook {
             if let Some(tx) = CLICK_TX.get() {
                 let _ = tx.send(event);
             }
-            // Swallow the key so Windows doesn't see e.g. Alt(Right)+Alt(Left)
-            // or Alt+Ctrl chords fire.
+            // Swallow so Windows doesn't see a bare Alt-up (which would
+            // open the window menu bar) or fire Ctrl-based shortcuts.
             return LRESULT(1);
         }
 
@@ -243,16 +281,15 @@ fn main() {
     let mut enigo = Enigo::new(&Settings::default()).expect("failed to init enigo");
 
     println!(
-        "ready. hold Right Alt for mouse mode. Left Ctrl = left click, Left Alt = right click. Ctrl-C to exit."
+        "ready. press Shift+CapsLock to toggle mouse mode. Right Alt = left click, Right Ctrl = right click. Ctrl-C to exit."
     );
 
     let mut session: Option<Session> = None;
     let mut last_move = Instant::now() - MOUSE_UPDATE_INTERVAL;
 
     // Button-held state — so we can release anything still down when mouse
-    // mode deactivates. Without this, dropping Right Alt while Right Ctrl
-    // is still physically held would leave the left mouse button stuck
-    // down (the key-up is passed through instead of intercepted).
+    // mode deactivates. Without this, toggling off while Right Ctrl is
+    // still physically held would leave the left mouse button stuck down.
     let mut left_down = false;
     let mut right_down = false;
 
@@ -263,7 +300,7 @@ fn main() {
     let mut last_active_state = false;
 
     loop {
-        let active = RIGHT_ALT_DOWN.load(Ordering::Acquire);
+        let active = MOUSE_MODE_ACTIVE.load(Ordering::Acquire);
 
         // State transitions.
         if active && !last_active_state {
