@@ -4,20 +4,47 @@ Turn your head, move the mouse. A Windows proof-of-concept that reads the IMU
 from XReal One AR glasses over TCP and drives the OS mouse cursor from head
 motion.
 
-> Status: **early POC**. Always-on head-to-cursor tracking works. Hotkey gating
-> and click bindings are not implemented yet — see [Roadmap](#roadmap).
+> Status: **working POC**. Head-to-cursor tracking, keyboard-gated activation,
+> and mouse clicks are all implemented.
+
+## Controls
+
+| Chord                        | Effect                                                         |
+| ---------------------------- | -------------------------------------------------------------- |
+| `Shift` + `CapsLock`         | Toggle mouse mode on/off (sticky). Caps-lock state unchanged.  |
+| `Left Ctrl` + `CapsLock`     | Hold to enable mouse mode; release to disable.                 |
+| `Right Alt` (mouse mode on)  | Left mouse button (press / release — drag works).              |
+| `Right Ctrl` (mouse mode on) | Right mouse button (press / release).                          |
+
+Notes:
+
+- Both activation chords swallow the `CapsLock` event so the Caps Lock LED /
+  text-casing state is never flipped.
+- `Left Ctrl` passes through on release, so no modifier ever gets stuck.
+- If sticky mode is already on, holding `LCtrl+CapsLock` is a no-op —
+  releasing restores the prior sticky state instead of clobbering it.
+- `Right Alt` / `Right Ctrl` are only consumed **while mouse mode is active**.
+  When inactive they pass through untouched, so `Left Ctrl` / `Left Alt`
+  shortcuts (`Ctrl+C`, `Alt+Tab`, etc.) always work normally.
+- `Ctrl-C` in the terminal quits.
 
 ## How it works
 
 - [`xreal_one_driver`](https://github.com/rohitsangwan01/xreal_one_driver)
   connects to the glasses at `169.254.2.1:52998` and streams IMU samples at
   ~1 kHz (gyro + accel + microsecond timestamp).
-- Each sample integrates yaw (gyro Z) and pitch (gyro X) into accumulated
-  angles since the session started.
-- Every 8 ms (~125 Hz), the program computes a desired cursor position
-  `start + angle * sensitivity` and nudges the cursor toward it using a
-  relative `SendInput` delta via [`enigo`](https://crates.io/crates/enigo).
-- The process declares itself **per-monitor DPI-aware v2** at startup so
+- A background thread drains the IMU socket and forwards samples to main over
+  an `mpsc` channel.
+- A low-level `WH_KEYBOARD_LL` hook thread observes every keystroke, tracks
+  modifier state, implements the activation chords, and routes click events
+  back to main through a second channel.
+- Main thread owns `enigo` (not `Send` on Windows) and each tick:
+  1. drains IMU samples, integrating yaw (`gyro[2]`) and pitch (`gyro[0]`)
+     into accumulated angles,
+  2. drains click events and presses/releases mouse buttons,
+  3. every 8 ms (~125 Hz), computes `desired = start + angle * sensitivity`
+     and nudges the cursor toward it with a relative `SendInput` delta.
+- Process declares itself **per-monitor DPI-aware v2** at startup so
   coordinates and deltas stay in raw physical pixels across mixed-DPI setups
   (primary + secondary + XReal AR virtual display).
 
@@ -44,21 +71,18 @@ The driver remaps the raw chip axes to a consistent frame. Empirically:
 cargo run --release
 ```
 
-On launch, the current cursor position is captured as the session origin.
-Look around and the cursor will track your head. `Ctrl-C` to quit.
-
-The release profile matters — debug builds drop IMU samples under load.
+The release profile matters — debug builds can drop IMU samples under load.
 
 ## Configuration
 
-Tweakable constants at the top of [`src/main.rs`](src/main.rs):
+Tweakable constants at the top of [src/main.rs](src/main.rs):
 
-| constant                  | default | meaning                              |
-| ------------------------- | ------- | ------------------------------------ |
-| `SENSITIVITY_X`           | `500.0` | pixels per radian of yaw             |
-| `SENSITIVITY_Y`           | `500.0` | pixels per radian of pitch           |
-| `MOUSE_UPDATE_INTERVAL`   | `8 ms`  | how often we inject mouse moves      |
-| `DEBUG_INTERVAL`          | `200 ms`| debug print rate                     |
+| constant                | default  | meaning                         |
+| ----------------------- | -------- | ------------------------------- |
+| `SENSITIVITY_X`         | `-2000`  | pixels per radian of yaw        |
+| `SENSITIVITY_Y`         | `2000`   | pixels per radian of pitch      |
+| `MOUSE_UPDATE_INTERVAL` | `8 ms`   | how often mouse moves are sent  |
+| `DEBUG_INTERVAL`        | `500 ms` | debug print rate                |
 
 Flip the sign of either sensitivity constant if your setup moves the wrong
 way.
@@ -69,14 +93,10 @@ way.
 - [x] **Milestone 2** — Identify pitch/yaw/roll axes empirically.
 - [x] **Milestone 3** — Always-on head-to-cursor tracking across multi-monitor
       DPI-scaled setups.
-- [ ] **Milestone 4** — Hold Right Alt to activate mouse mode; release to
-      freeze cursor. Naturally resets session drift on each press.
-- [ ] **Milestone 5** — Right Ctrl = left click, Right Shift = right click
-      (press/release semantics for drag support).
-
-Known trade-off for milestone 4: `global-hotkey` wraps Windows `RegisterHotKey`
-which **swallows** the key, so Right Alt will not pass through to other apps
-while armouse is running (this breaks AltGr for international keyboards).
+- [x] **Milestone 4** — Keyboard-gated activation (sticky toggle + momentary
+      hold) via a low-level keyboard hook.
+- [x] **Milestone 5** — Left / right click bindings with press/release
+      semantics for drag support.
 
 ## License
 
