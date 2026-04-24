@@ -1,9 +1,13 @@
 // armouse: head-motion mouse control for XReal One glasses on Windows.
 //
 // Controls:
-//   - Shift+CapsLock: toggle mouse mode on/off. The Caps Lock state is NOT
-//     affected — we swallow both the Shift and Caps Lock events in this
-//     chord so Windows never sees it.
+//   - Shift+CapsLock: toggle mouse mode on/off (sticky). The Caps Lock
+//     state is NOT affected — we swallow both the Shift and Caps Lock
+//     events in this chord so Windows never sees it.
+//   - Left Ctrl + CapsLock (hold): enable mouse mode while held, disable
+//     on release. The CapsLock event is swallowed; Left Ctrl passes
+//     through on release so no modifier ever gets stuck. If sticky mode
+//     was already on, the hold is a no-op (it won't clobber sticky state).
 //   - While mouse mode is active:
 //       * head motion drives the cursor
 //       * Right Alt  = left click  (press/release, so drag works)
@@ -80,7 +84,7 @@ mod kb_hook {
     use std::sync::atomic::{AtomicBool, Ordering};
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        VK_CAPITAL, VK_LSHIFT, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
+        VK_CAPITAL, VK_LCONTROL, VK_LSHIFT, VK_RCONTROL, VK_RMENU, VK_RSHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
@@ -88,13 +92,30 @@ mod kb_hook {
         WM_SYSKEYUP,
     };
 
-    // Local shift tracking. The hook sees every key event so we can trust
-    // these; we don't need to query Windows.
+    // Local modifier tracking. The hook sees every key event so we can
+    // trust these; we don't need to query Windows.
     static LSHIFT_DOWN: AtomicBool = AtomicBool::new(false);
     static RSHIFT_DOWN: AtomicBool = AtomicBool::new(false);
+    static LCTRL_DOWN: AtomicBool = AtomicBool::new(false);
+
+    // True while the user is holding Left Ctrl + Caps Lock to force mouse
+    // mode on. On entering hold mode we remember whether sticky mode was
+    // already active, so releasing the hold restores the prior state
+    // instead of blindly turning mouse mode off.
+    static HOLD_ACTIVE: AtomicBool = AtomicBool::new(false);
+    static HOLD_PREV_STICKY: AtomicBool = AtomicBool::new(false);
 
     fn shift_held() -> bool {
         LSHIFT_DOWN.load(Ordering::Acquire) || RSHIFT_DOWN.load(Ordering::Acquire)
+    }
+
+    fn exit_hold_mode() {
+        if HOLD_ACTIVE.swap(false, Ordering::AcqRel) {
+            // Restore mouse mode to whatever sticky state was before the
+            // hold began.
+            let prev = HOLD_PREV_STICKY.load(Ordering::Acquire);
+            MOUSE_MODE_ACTIVE.store(prev, Ordering::Release);
+        }
     }
 
     unsafe extern "system" fn low_level_keyboard_proc(
@@ -130,10 +151,40 @@ mod kb_hook {
             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
         }
 
-        // Caps Lock: if Shift is held, this is our toggle chord. Swallow
-        // every event so Windows never processes it and the caps-lock LED
-        // / state stays unchanged.
+        // Left Ctrl: track state, always pass through. If we're in hold
+        // mode and LCtrl comes up, exit hold mode (but let the key event
+        // itself propagate so Windows sees the modifier release cleanly).
+        if vk == VK_LCONTROL.0 as u32 {
+            if is_down {
+                LCTRL_DOWN.store(true, Ordering::Release);
+            } else if is_up {
+                LCTRL_DOWN.store(false, Ordering::Release);
+                exit_hold_mode();
+            }
+            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
+        }
+
+        // Caps Lock: chords take precedence over the normal behaviour.
         if vk == VK_CAPITAL.0 as u32 {
+            // Left Ctrl + CapsLock: hold-to-track. Engaging on key-down,
+            // disengaging on key-up. Swallow both so Caps Lock state is
+            // untouched.
+            if LCTRL_DOWN.load(Ordering::Acquire) {
+                if is_down {
+                    // Only arm hold-mode on the first down edge — auto-
+                    // repeats will hit this path too but the swap below
+                    // makes them idempotent.
+                    if !HOLD_ACTIVE.swap(true, Ordering::AcqRel) {
+                        HOLD_PREV_STICKY
+                            .store(MOUSE_MODE_ACTIVE.load(Ordering::Acquire), Ordering::Release);
+                        MOUSE_MODE_ACTIVE.store(true, Ordering::Release);
+                    }
+                } else if is_up {
+                    exit_hold_mode();
+                }
+                return LRESULT(1);
+            }
+
             if shift_held() {
                 if is_down {
                     // Toggle on the key-down edge, ignore auto-repeats by
@@ -144,7 +195,8 @@ mod kb_hook {
                 }
                 return LRESULT(1);
             }
-            // No shift held — let Caps Lock work normally.
+
+            // No modifier chord — let Caps Lock work normally.
             return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
         }
 
@@ -281,7 +333,7 @@ fn main() {
     let mut enigo = Enigo::new(&Settings::default()).expect("failed to init enigo");
 
     println!(
-        "ready. press Shift+CapsLock to toggle mouse mode. Right Alt = left click, Right Ctrl = right click. Ctrl-C to exit."
+        "ready. Shift+CapsLock = toggle mouse mode, LCtrl+CapsLock = hold mouse mode. Right Alt = left click, Right Ctrl = right click. Ctrl-C to exit."
     );
 
     let mut session: Option<Session> = None;
