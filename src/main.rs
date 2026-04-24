@@ -1,20 +1,23 @@
 // armouse: head-motion mouse control for XReal One glasses on Windows.
 //
-// Milestone 4: hold Right Alt to activate. While held, head motion drives
-// the cursor using the session-based absolute-via-relative-delta algorithm
-// from milestone 3. Release Right Alt to freeze the cursor.
+// Milestone 5: while Right Alt is held (mouse-mode active), Left Ctrl is
+// a left-click and Left Alt is a right-click, with press/release semantics
+// so drag works. When Right Alt is NOT held, Left Ctrl / Left Alt pass
+// through to Windows unchanged.
 //
 // Threading model:
 //   - IMU reader thread: loops xreal.next() and pushes samples through an
 //     mpsc channel. Keeps the TCP socket drained even while we're idle.
 //   - Keyboard hook thread: installs a WH_KEYBOARD_LL hook and runs a
-//     Windows message pump. The hook callback flips an AtomicBool for
-//     Right Alt. Low-level hooks observe input without consuming it, so
-//     Right Alt still works normally for other apps (unlike RegisterHotKey).
-//   - Main thread: owns Enigo. Every tick it checks the atomic, drains the
-//     IMU channel, integrates gyro into the current Session, and nudges
-//     the cursor toward the desired position. On the false->true edge it
-//     starts a new Session (recapturing cursor origin, zeroing angles).
+//     Windows message pump. The hook callback
+//       * flips an AtomicBool for Right Alt (observed, always passes through)
+//       * for Left Ctrl / Left Alt:
+//         - if Right Alt is held: consume the event and send a ClickEvent
+//           through an mpsc channel to the main thread
+//         - if not held: let it pass through normally
+//   - Main thread: owns Enigo. Each tick it drains both channels, integrates
+//     gyro into the current Session, nudges the cursor toward desired, and
+//     emits left/right mouse press/release events.
 //
 // Axis mapping (empirical):
 //   gyro[0] = pitch (negative = looking down)
@@ -22,12 +25,23 @@
 //   gyro[2] = yaw   (negative = looking left)
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use enigo::{Coordinate, Enigo, Mouse, Settings};
+use enigo::{Button, Coordinate, Direction, Enigo, Mouse, Settings};
 use xreal_one_driver::{XOImu, XrealOne};
+
+#[derive(Debug, Clone, Copy)]
+enum ClickEvent {
+    Left(Direction),
+    Right(Direction),
+}
+
+// Channel the keyboard hook uses to send click events to main. Wrapped in a
+// OnceLock because the hook callback is a plain extern fn (no closure capture).
+static CLICK_TX: OnceLock<Sender<ClickEvent>> = OnceLock::new();
 
 // pixels per radian. Sign chosen so the cursor tracks head direction:
 //   look right -> cursor right, look down -> cursor down.
@@ -56,10 +70,11 @@ fn enable_per_monitor_dpi_awareness() {
 
 #[cfg(windows)]
 mod kb_hook {
-    use super::RIGHT_ALT_DOWN;
+    use super::{ClickEvent, CLICK_TX, RIGHT_ALT_DOWN};
+    use enigo::Direction;
     use std::sync::atomic::Ordering;
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-    use windows::Win32::UI::Input::KeyboardAndMouse::VK_RMENU;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LCONTROL, VK_LMENU, VK_RMENU};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
         HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
@@ -71,21 +86,51 @@ mod kb_hook {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        if code >= 0 {
-            let kbd = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
-            if kbd.vkCode == VK_RMENU.0 as u32 {
-                match wparam.0 as u32 {
-                    WM_KEYDOWN | WM_SYSKEYDOWN => {
-                        RIGHT_ALT_DOWN.store(true, Ordering::Release);
-                    }
-                    WM_KEYUP | WM_SYSKEYUP => {
-                        RIGHT_ALT_DOWN.store(false, Ordering::Release);
-                    }
-                    _ => {}
-                }
-            }
+        if code < 0 {
+            return CallNextHookEx(HHOOK::default(), code, wparam, lparam);
         }
-        // Always pass the event through. We're observing, not consuming.
+
+        let kbd = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
+        let msg = wparam.0 as u32;
+        let is_down = matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN);
+        let is_up = matches!(msg, WM_KEYUP | WM_SYSKEYUP);
+        let vk = kbd.vkCode;
+
+        // Right Alt: update shared state and swallow. If we let it through,
+        // Windows sees a bare Alt keystroke on release and activates the
+        // active window's menu bar (or the context menu for some apps).
+        // Trade-off: Right Alt cannot function as AltGr while armouse runs.
+        if vk == VK_RMENU.0 as u32 {
+            if is_down {
+                RIGHT_ALT_DOWN.store(true, Ordering::Release);
+            } else if is_up {
+                RIGHT_ALT_DOWN.store(false, Ordering::Release);
+            }
+            return LRESULT(1);
+        }
+
+        // Left Ctrl / Left Alt: only intercept while mouse mode is active.
+        // Otherwise they must pass through untouched.
+        let click_key = vk == VK_LCONTROL.0 as u32 || vk == VK_LMENU.0 as u32;
+        if click_key && RIGHT_ALT_DOWN.load(Ordering::Acquire) && (is_down || is_up) {
+            let dir = if is_down {
+                Direction::Press
+            } else {
+                Direction::Release
+            };
+            let event = if vk == VK_LCONTROL.0 as u32 {
+                ClickEvent::Left(dir)
+            } else {
+                ClickEvent::Right(dir)
+            };
+            if let Some(tx) = CLICK_TX.get() {
+                let _ = tx.send(event);
+            }
+            // Swallow the key so Windows doesn't see e.g. Alt(Right)+Alt(Left)
+            // or Alt+Ctrl chords fire.
+            return LRESULT(1);
+        }
+
         CallNextHookEx(HHOOK::default(), code, wparam, lparam)
     }
 
@@ -94,14 +139,12 @@ mod kb_hook {
         unsafe {
             let _hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), None, 0)
                 .expect("failed to install WH_KEYBOARD_LL hook");
-            // Message pump — required for low-level hooks to be called.
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
-        // GetMessageW only returns FALSE on WM_QUIT, which we never post.
         loop {
             std::thread::park();
         }
@@ -187,17 +230,31 @@ fn main() {
 
     let imu_rx = spawn_imu_thread();
 
+    // Click-event channel must be installed BEFORE the hook thread starts,
+    // otherwise early events would be dropped.
+    let (click_tx, click_rx) = mpsc::channel::<ClickEvent>();
+    CLICK_TX
+        .set(click_tx)
+        .expect("CLICK_TX already initialised");
+
     #[cfg(windows)]
     spawn_kb_hook_thread();
 
     let mut enigo = Enigo::new(&Settings::default()).expect("failed to init enigo");
 
     println!(
-        "ready. hold Right Alt to activate head tracking; release to freeze. Ctrl-C to exit."
+        "ready. hold Right Alt for mouse mode. Left Ctrl = left click, Left Alt = right click. Ctrl-C to exit."
     );
 
     let mut session: Option<Session> = None;
     let mut last_move = Instant::now() - MOUSE_UPDATE_INTERVAL;
+
+    // Button-held state — so we can release anything still down when mouse
+    // mode deactivates. Without this, dropping Right Alt while Right Ctrl
+    // is still physically held would leave the left mouse button stuck
+    // down (the key-up is passed through instead of intercepted).
+    let mut left_down = false;
+    let mut right_down = false;
 
     // Debug counters
     let mut samples_since_debug: u32 = 0;
@@ -222,6 +279,19 @@ fn main() {
             }
         } else if !active && last_active_state {
             session = None;
+            // Release any mouse buttons still physically "held" via Ctrl/Shift.
+            if left_down {
+                enigo
+                    .button(Button::Left, Direction::Release)
+                    .expect("failed to release left button");
+                left_down = false;
+            }
+            if right_down {
+                enigo
+                    .button(Button::Right, Direction::Release)
+                    .expect("failed to release right button");
+                right_down = false;
+            }
             println!("[IDLE]");
         }
         last_active_state = active;
@@ -240,6 +310,26 @@ fn main() {
                 Err(TryRecvError::Disconnected) => {
                     panic!("IMU thread died");
                 }
+            }
+        }
+
+        // Drain click events.
+        loop {
+            match click_rx.try_recv() {
+                Ok(ClickEvent::Left(dir)) => {
+                    enigo
+                        .button(Button::Left, dir)
+                        .expect("failed to send left click");
+                    left_down = matches!(dir, Direction::Press);
+                }
+                Ok(ClickEvent::Right(dir)) => {
+                    enigo
+                        .button(Button::Right, dir)
+                        .expect("failed to send right click");
+                    right_down = matches!(dir, Direction::Press);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
             }
         }
 
